@@ -53,11 +53,13 @@ That design is only justified if a GLV genuinely needs >~33 markets — a rare c
 
 ## Part C — Judgment AI can't provide
 
-1. LLM models are still not good enough when it comes to blockchain development / smart contracts work. During my analysis it assumed 800k requested compute celing as the compute being consumed by the transaction when it supports 12 markets, based on which it deducted that 1.4M compute limit should allow max 24 markets. LLM models can be helpful when proeprly prompted and guided in the work to be done, and probably cannot still do compelete development work independently. 
+1. **Knowing which number is authoritative, and which one is an estimate.** The AI treated the keeper's *requested* 800k compute limit as the compute actually *consumed* at 12 markets, and from that concluded the 1.4M cap allowed only ~24 markets. An engineer who has shipped on Solana knows requested ≠ consumed, and will refer to mainnet transactions for the actual `computeUnitsConsumed` before acting on any number. Knowing where the real signal lives is a call the model can't make about its own output.
 
-2. DeFi protocols are prone to high risk which LLM models fail to account for when proposing solutions / implementing code. It suggested me to implement cache for market data within the glv account as a probable solution without accounting for front-run risk that will expose the protocol to. 
+2. **Whether to accept a front-run / staleness surface at all.** This is the judgment the whole design hangs on. The AI proposed caching market data in the GLV account as a clean win without pricing the front-run exposure it opens (a stale value someone can trade against, at other LPs' expense). Whether that risk is acceptable — and at what `max_age`, against how much TVL, given how fast a constituent market's pool state can move between valuation and settlement — is a risk-appetite call grounded in operating a DeFi protocol, not something a model weighs.
 
-3. Tuning `max_age` - The right window (~1–2 min in Report_1) isn't derivable from code — it depends on our keepers' real latency between `set_prices` and execute. AI can lay out the trade-off; it can't know what our fleet can actually hold on mainnet.
+3. **Tuning `max_age`.** The right window (~1–2 min in Report_1) isn't derivable from code — it depends on our keepers' real latency between `set_prices` and execute, and behaviour under congestion. AI can lay out the trade-off; it can't know what our fleet can actually hold on mainnet.
+
+4. **Ranking the effective ceiling by the op that endangers funds, not the average.** A GLV where deposits land but withdrawals can't fit in a tx isn't "a bit smaller" — it's a vault users can't exit, an incident. Treating withdrawal as *the* binding op (the minimum across ops) is a funds-safety judgment that comes from thinking about what pages you at 3am, not from the account math.
 
 ---
 

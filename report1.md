@@ -2,7 +2,7 @@
 
 ## 1. Root cause
 
-The `Glv` account can store up to **96** markets as defined [here](https://github.com/gmsol-labs/gmx-solana/blob/0d6a53816f42ef49d7fd6beba48b417e896d48f8/programs/store/src/states/glv.rs#L29), but operationally the ceiling is ~12 markets which is imposed by Solana's [per-transaction account-lock limit of 64](https://solana.com/docs/core/transactions), which gets hit at execution time when >64 accounts get passed: **~30 fixed accounts + 3 × number of markets + 2 shared feeds** — per market we pass the market a/c, GM token mint and index-token price feed, plus 2 feeds for the long/short tokens all the markets share. the withdrawal path carries the heaviest fixed shell and tips over 64 once markets > 10; the deposit paths go over a market or two later — hence the observed "~12".
+The `Glv` account can store up to **96** markets as defined [here](https://github.com/gmsol-labs/gmx-solana/blob/0d6a53816f42ef49d7fd6beba48b417e896d48f8/programs/store/src/states/glv.rs#L29), but operationally the ceiling is ~12 markets which is imposed by Solana's [per-transaction account-lock limit of 64](https://solana.com/docs/core/transactions), which gets hit at execution time when >64 accounts get passed: **~28-30 fixed accounts + 3 × number of markets + 2 shared feeds** — per market we pass the market a/c, GM token mint and index-token price feed, plus 2 feeds for the long/short tokens all the markets share. the withdrawal path carries the heaviest fixed shell, so it's the binding op and tips over 64 right around 12 markets; the deposit paths are a touch lighter and go over a market later — so the usable ceiling is the withdrawal one, the observed "~12".
 
 ## 2. How we confirmed it?
 I am familiar with solana's transaction size / compute budget / account number related restrictions and just looking at the code i could see we were properly using `Box<>`, `ALT`s etc which help overcome the solana compute budget / tx size limits. each Market account is roughly 10KB, so loading/deserializing 12 of them (~120KB of account data) sits comfortably inside the 800k CU budget the keeper already sets, and tx-size wise the ALTs keep the message well under the 1232 byte cap. so neither of those is the wall here.
@@ -11,7 +11,7 @@ I am familiar with solana's transaction size / compute budget / account number r
 
 plus, adding 1 more market above 12 barely moves tx size / compute budget, but it does add 3 more accounts, and we're already sitting right at the 64 limit -- so it was easy to pin the failure on the account count and not something else.
 
-to pin the exact ceiling i hand-counted the accounts in the `ExecuteGlvWithdrawal` + `CloseGlvWithdrawal` structs (withdrawal is the heaviest bundle a keeper submits): ~30 accounts that don't scale with market count. `30 + 3N + 2 <= 64` gives `N <= 10`, which matches where ops actually start failing. a tx one market over the line gets rejected with `TransactionError::TooManyAccountLocks` (the lock-count error) -- not the "transaction too large" error you'd see if bytes were the wall, which is the final confirmation it's `MAX_TX_ACCOUNT_LOCKS = 64` and nothing else.
+to pin the ceiling i hand-counted the accounts in the `ExecuteGlvWithdrawal` (+ `CloseGlvWithdrawal`) bundle, which is the heaviest a keeper submits: ~28-30 accounts that don't scale with market count (the exact number flexes by a couple depending on which close/ATA accounts ride in the same tx). `~28 + 3N + 2 <= 64` puts the withdrawal ceiling right around `N ≈ 12`, which is exactly where ops start failing. and a tx one market over the line gets rejected with `TransactionError::TooManyAccountLocks` (the lock-count error) -- not the "transaction too large" error you'd see if bytes were the wall, which is the final confirmation it's `MAX_TX_ACCOUNT_LOCKS = 64` and nothing else.
 
 ## 3. Recommended Fix
 Our recommended fix involves reducing the number of accounts to be passed per market from 3 to 1 as follows: 
@@ -65,20 +65,20 @@ impl Market {
 }
 ```
 
-- **Fix 2: Cache prices into an `Oracle` account (removes the feed) with expiry ~1-2 mins, enough to complete the deposit / withdraw tx and without adding any front-run risk vector to the user-flow.**
+- **Fix 2: Cache prices into an `Oracle` account (removes the feed) with a tight expiry (~1-2 mins), enough to complete the deposit / withdraw tx. Unlike Fix 1, this one does open a (small, bounded) staleness/front-run window — the trade-off is discussed below**
 
-**Reasoning →** This fix will introduce a bit of price staleness risk into the equation, for which we need to keep oracle price expiry here to <2-3 mins to keep the risk under check. Given that chainlink quotes TWAP prices and not spot prices anyways, its upto the team to decide if this price-risk is worth the trade off of being able to support ~10 more markets per ` glv` vault.
+**Reasoning →** This fix introduces a bit of price staleness risk into the equation, for which we keep the oracle price expiry tight (<2-3 mins) to keep the risk under check. Given that chainlink quotes TWAP prices and not spot prices anyways, its upto the team to decide if this price-risk is worth the trade off of being able to support ~10 more markets per ` glv` vault.
 
 **Impact →** on top of Fix 1, it takes the effective ceiling to **~33 markets** (`30 + N + 1 <= 64`). Fix 2 on its own is ~17 (`30 + 2N <= 64`) — the big jump comes from stacking both.
 
-**Good part →** the protocol already has most of this plumbing: `set_prices_from_price_feed` already writes prices into the Oracle account, and the valuation path already reads them back from there rather than from the split feeds:
+**Good part →** the building blocks already exist, though this is a genuine change to the price flow, not a free reuse. Two pieces are already there: (a) a persistent price path, `set_prices_from_price_feed`, that writes prices into the Oracle account, and (b) the valuation reads the index price *off the oracle* via `get_primary_price`:
 
 ```rust
-// programs/store/src/ops/glv.rs:1122 -- price already comes off the oracle, not from remaining_accounts
+// programs/store/src/ops/glv.rs:1122
 prices.index_token_price = oracle.get_primary_price(&index_token_mint, true)?;
 ```
 
-so the change is basically: stop requiring a feed a/c per market in `remaining_accounts`, and instead lean on a preceding `set_prices` transaction before the OP tx, with a max_age check so a stale price gets rejected (the `max_age` param already exists on the value ops today, eg `GetGlvTokenValue { max_age: 60, .. }`):
+The catch (and why this is a real change, not just plumbing): today the GLV path wraps that read in `Oracle::with_prices`, which loads the prices *from the per-market feed accounts* transiently and then calls `clear_all_prices()` at the end of the same instruction — so the feeds are still the source, and prices are deliberately *not* persisted. Fix 2 therefore switches the GLV valuation from this transient load to the persistent path: stop passing a feed a/c per market in `remaining_accounts`, and instead run a preceding `set_prices` transaction before the OP tx, with a max_age check so a stale price gets rejected (the `max_age` param already exists on the value ops today, eg `GetGlvTokenValue { max_age: 60, .. }`):
 
 ```rust
 // the read enforces freshness itself instead of us passing a per-market feed a/c
@@ -107,7 +107,7 @@ if someday we genuinely need to go all the way to 96 markets, just shrinking the
 
 ## 5. How I'd validate the fix
 
-1. **Gauge the fixes with an AI model first.** before we lock anything in, we'll walk an AI model through both fixes and have it enumerate the risk scenarios -- stale-price windows + front-run timing on Fix 2, missed supply-update paths on Fix 1, etc -- and simulate the trade-offs, so we widen the net on edge cases early, before writing the actual tests or touching any audited code.
+1. **Enumerate the risk scenarios with AI first.** prompt AI model to enumerate the failure modes for each fix -- stale-price window + front-run timing on Fix 2, every mint/burn path that must update the cache on Fix 1 -- and walk each against the existing invariants, so we properly understand + simulate the risk matrix before making any changes
 
 2. **Cache-correctness test (Fix 1).** after every op that touches GM supply (deposit / withdrawal / shift / glv settle), assert `market.market_token_supply == mint.supply`. run a randomized sequence of mixed ops across a few markets and assert it holds the whole way through.
 
